@@ -3,11 +3,12 @@ use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
     parse_macro_input, punctuated::Punctuated, spanned::Spanned, token::Comma,
-    AngleBracketedGenericArguments, Data, DataStruct, DeriveInput, Field, Fields, FieldsNamed,
-    GenericArgument, Ident, Path, PathArguments, PathSegment, Type, TypePath,
+    AngleBracketedGenericArguments, Data, DataStruct, DeriveInput, Expr, ExprLit, Field, Fields,
+    FieldsNamed, GenericArgument, Ident, Lit, Meta, MetaNameValue, Path, PathArguments,
+    PathSegment, Type, TypePath,
 };
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     match generate(&input) {
@@ -40,15 +41,22 @@ fn geterate_builder_struct_field(input: &DeriveInput) -> syn::Result<TokenStream
         .iter()
         .map(|f| {
             // 06 optional：Option
-            if let Some(inner_ty) = get_optional_inner_fields(&f.ty) {
-                return inner_ty;
+            if let Some(inner_ty) = get_generic_inner_field(&f.ty, "Option") {
+                return Ok(quote!(std::option::Option<#inner_ty>));
             }
-            &f.ty
+            // 07 repeated field, 拥有 each 属性，那么就不使用 Option 包裹
+            if get_each_attr(f)?.is_some() {
+                let with_each_field = &f.ty;
+                return Ok(quote!(#with_each_field));
+            }
+            let no_option_ty = &f.ty;
+            Ok(quote!(std::option::Option<#no_option_ty>))
         })
-        .collect::<Vec<_>>();
+        .collect::<syn::Result<Vec<_>>>();
 
+    let types = types?;
     let ret = quote! {
-        #(#idents: std::option::Option<#types>), *
+        #(#idents: #types), *
     };
 
     // 新结构体字段类型
@@ -62,12 +70,18 @@ fn generate_builder_impl_factory(input: &DeriveInput) -> syn::Result<Vec<TokenSt
         .iter()
         .map(|f| {
             let name = &f.ident;
-            quote! {
-                #name: std::option::Option::None
+            // 07 repeated field，拥有 each 属性的工厂函数，返回一个空的 Vec
+            if get_each_attr(f)?.is_some() {
+                return Ok(quote! {
+                    #name: std::vec::Vec::new()
+                });
             }
+            Ok(quote! {
+                #name: std::option::Option::None
+            })
         })
-        .collect::<Vec<_>>();
-    Ok(init_fields)
+        .collect::<syn::Result<Vec<_>>>();
+    init_fields
 }
 
 // 03 setter function
@@ -79,7 +93,7 @@ fn generate_setter_function(input: &DeriveInput) -> syn::Result<TokenStream2> {
         .iter()
         .map(|f| {
             // 06 optional：Option
-            if let Some(inner_type) = get_optional_inner_fields(&f.ty) {
+            if let Some(inner_type) = get_generic_inner_field(&f.ty, "Option") {
                 return inner_type;
             }
             &f.ty
@@ -88,13 +102,45 @@ fn generate_setter_function(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     let mut final_tokenstream = TokenStream2::new();
 
-    for (ident, r#type) in idents.iter().zip(types.iter()) {
-        let tokenstream_piece = quote! {
-            fn #ident(&mut self, #ident: #r#type) -> &mut Self{
-                self.#ident = std::option::Option::Some(#ident);
-                self
+    for (index, (ident, r#type)) in idents.iter().zip(types.iter()).enumerate() {
+        let tokenstream_piece = if let Some(ref user_specified_ident) =
+            get_each_attr(&fields[index])?
+        {
+            let inner_type = get_generic_inner_field(r#type, "Vec")
+                .ok_or(syn::Error::new(fields[index].span(), "Must be a Vec"))?;
+            // eprintln!(
+            //     "{:#?} == {:#?}: {}",
+            //     user_specified_ident,
+            //     ident.as_ref().unwrap(),
+            //     user_specified_ident == ident.as_ref().unwrap()
+            // );
+
+            let mut tokenstream_piece = quote! {
+                fn #user_specified_ident(&mut self, #user_specified_ident: #inner_type) -> &mut Self{
+                    self.#ident.push(#user_specified_ident);
+                    self
+                }
+            };
+
+            // 07 repeated field：如果用户指定的字段不同，那么 args 指定的参数将替换原有的内容
+            if user_specified_ident != ident.as_ref().unwrap() {
+                tokenstream_piece.extend(quote! {
+                    fn #ident(&mut self, #ident: #r#type) -> &mut Self{
+                        self.#ident = #ident.clone();
+                        self
+                    }
+                })
+            }
+            tokenstream_piece
+        } else {
+            quote! {
+                fn #ident(&mut self, #ident: #r#type) -> &mut Self{
+                    self.#ident = std::option::Option::Some(#ident);
+                    self
+                }
             }
         };
+
         final_tokenstream.extend(tokenstream_piece);
     }
     Ok(final_tokenstream)
@@ -125,8 +171,10 @@ fn generate_call_build(input: &DeriveInput) -> syn::Result<TokenStream2> {
      */
     // 检查是否有字段未赋值
     for idx in 0..fields.len() {
-        // 06 optional：Option new!
-        if get_optional_inner_fields(types[idx]).is_none() {
+        // 06 optional：Option new! && 07 repeated field 排除 each 字段的检查
+        if get_generic_inner_field(types[idx], "Option").is_none()
+            && get_each_attr(&fields[idx])?.is_none()
+        {
             let ident = &fields[idx].ident;
             checker_code.push(quote! {
                 if self.#ident.is_none() {
@@ -142,7 +190,11 @@ fn generate_call_build(input: &DeriveInput) -> syn::Result<TokenStream2> {
     for idx in 0..fields.len() {
         let ident = &fields[idx].ident;
         // 06 optional：Option，只有当字段类型不是 Option 时，才调用 unwrap
-        if get_optional_inner_fields(&fields[idx].ty).is_none() {
+        if get_each_attr(&fields[idx])?.is_some() {
+            fill_command.push(quote! {
+                #ident: self.#ident.clone()
+            })
+        } else if get_generic_inner_field(&fields[idx].ty, "Option").is_none() {
             fill_command.push(quote! {
                 #ident: self.#ident.clone().unwrap()
             })
@@ -170,7 +222,8 @@ fn generate_call_build(input: &DeriveInput) -> syn::Result<TokenStream2> {
 }
 
 // 06 otpional field
-fn get_optional_inner_fields(ty: &Type) -> Option<&Type> {
+/// other_ident_name: 获取某个包裹字段中的 T（Option<T>）
+fn get_generic_inner_field<'a>(ty: &'a Type, other_ident_name: &str) -> Option<&'a Type> {
     if let Type::Path(TypePath {
         path: Path { segments, .. },
         ..
@@ -178,7 +231,7 @@ fn get_optional_inner_fields(ty: &Type) -> Option<&Type> {
     {
         // 只有最后一个元素才会包含 Option
         if let Some(PathSegment { ident, arguments }) = segments.last() {
-            if ident == "Option" {
+            if ident == other_ident_name {
                 // Option<T> 中的 T 只有一个
                 if let PathArguments::AngleBracketed(AngleBracketedGenericArguments {
                     args, ..
@@ -192,6 +245,43 @@ fn get_optional_inner_fields(ty: &Type) -> Option<&Type> {
         }
     }
     None
+}
+
+// 07 repeated field（获取 each 属性）
+fn get_each_attr(field: &Field) -> syn::Result<Option<Ident>> {
+    for attr in &field.attrs {
+        if attr.path().is_ident("builder") {
+            // 解析该类型：#[builder(each = "...")]
+            let meta = attr.parse_args::<Meta>().unwrap();
+            if let Meta::NameValue(MetaNameValue {
+                path: Path { segments, .. },
+                value,
+                ..
+            }) = meta
+            {
+                if let Some(PathSegment { ident, .. }) = segments.first() {
+                    if ident == "each" {
+                        if let Expr::Lit(ExprLit {
+                            lit: Lit::Str(lit_str),
+                            ..
+                        }) = value
+                        {
+                            return Ok(Some(Ident::new(lit_str.value().as_str(), attr.span())));
+                        }
+                    }
+
+                    if ident != "each" {
+                        // eprintln!("list: {:#?}", list);
+                        return Err(syn::Error::new_spanned(
+                            attr,
+                            r#"expected `builder(each = "...")`"#,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn generate(input: &DeriveInput) -> syn::Result<TokenStream2> {
@@ -236,3 +326,12 @@ fn generate(input: &DeriveInput) -> syn::Result<TokenStream2> {
     );
     Ok(ret)
 }
+
+// #[proc_macro_derive(Explore, attributes(Foo))]
+// pub fn explore(input: TokenStream) -> TokenStream {
+//     let input = parse_macro_input!(input as DeriveInput);
+//     let attr = input.attrs.first().unwrap();
+//     // 解析该类型：#[Foo::Bar(test = "test", handle1 = "handle1")]
+//     eprintln!("{:#?}", attr);
+//     TokenStream2::new().into()
+// }
