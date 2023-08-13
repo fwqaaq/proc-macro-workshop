@@ -1,28 +1,58 @@
-// Ensure that your macro reports a reasonable error message when the caller
-// mistypes the inert attribute in various ways. This is a compile_fail test.
+// There are some cases where no heuristic would be sufficient to infer the
+// right trait bounds based only on the information available during macro
+// expansion.
 //
-// The preferred way to report an error from a procedural macro is by including
-// an invocation of the standard library's compile_error macro in the code
-// emitted by the procedural macro.
+// When this happens, we'll turn to attributes as a way for the caller to
+// handwrite the correct trait bounds themselves.
 //
+// The impl for Wrapper<T> in the code below will need to include the bounds
+// provided in the `debug(bound = "...")` attribute. When such an attribute is
+// present, also disable all inference of bounds so that the macro does not
+// attach its own `T: Debug` inferred bound.
 //
-// Resources:
+//     impl<T: Trait> Debug for Wrapper<T>
+//     where
+//         T::Value: Debug,
+//     {...}
 //
-//   - The compile_error macro for emitting basic custom errors:
-//     https://doc.rust-lang.org/std/macro.compile_error.html
+// Optionally, though this is not covered by the test suite, also accept
+// `debug(bound = "...")` attributes on individual fields. This should
+// substitute only whatever bounds are inferred based on that field's type,
+// without removing bounds inferred based on the other fields:
 //
-//   - Lowering a syn::Error into an invocation of compile_error:
-//     https://docs.rs/syn/1.0/syn/struct.Error.html#method.to_compile_error
+//     #[derive(CustomDebug)]
+//     pub struct Wrapper<T: Trait, U> {
+//         #[debug(bound = "T::Value: Debug")]
+//         field: Field<T>,
+//         normal: U,
+//     }
 
-use derive_builder::Builder;
+use derive_debug::CustomDebug;
+use std::fmt::Debug;
 
-#[derive(Builder)]
-pub struct Command {
-    executable: String,
-    #[builder(eac = "arg")]
-    args: Vec<String>,
-    env: Vec<String>,
-    current_dir: Option<String>,
+pub trait Trait {
+    type Value;
 }
 
-fn main() {}
+#[derive(CustomDebug)]
+#[debug(bound = "T::Value: Debug")]
+pub struct Wrapper<T: Trait> {
+    field: Field<T>,
+}
+
+#[derive(CustomDebug)]
+struct Field<T: Trait> {
+    values: Vec<T::Value>,
+}
+
+fn assert_debug<F: Debug>() {}
+
+fn main() {
+    struct Id;
+
+    impl Trait for Id {
+        type Value = u8;
+    }
+
+    assert_debug::<Wrapper<Id>>();
+}
